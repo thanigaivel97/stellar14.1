@@ -3,15 +3,16 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "transactions/InflationOpFrame.h"
+#include "crypto/SHA.h"
+#include "ledger/AccountFrame.h"
+#include "ledger/LedgerDelta.h"
 #include "ledger/LedgerManager.h"
-#include "ledger/LedgerTxn.h"
-#include "ledger/LedgerTxnEntry.h"
-#include "ledger/LedgerTxnHeader.h"
 #include "main/Application.h"
+#include "medida/meter.h"
+#include "medida/metrics_registry.h"
 #include "overlay/StellarXDR.h"
-#include "transactions/TransactionUtils.h"
 
-const uint32_t INFLATION_FREQUENCY = (60 * 60 * 24 * 7); // every 7 days
+const uint32_t INFLATION_FREQUENCY = (60 * 60 * 24 * 7); // every seven days
 // inflation is .000190721 per 7 days, or 1% a year
 const int64_t INFLATION_RATE_TRILLIONTHS = 190721000LL;
 const int64_t TRILLION = 1000000000000LL;
@@ -28,16 +29,22 @@ InflationOpFrame::InflationOpFrame(Operation const& op, OperationResult& res,
 }
 
 bool
-InflationOpFrame::doApply(AbstractLedgerTxn& ltx)
+InflationOpFrame::doApply(Application& app, LedgerDelta& delta,
+                          LedgerManager& ledgerManager)
 {
-    auto header = ltx.loadHeader();
-    auto& lh = header.current();
-    time_t closeTime = lh.scpValue.closeTime;
-    uint64_t seq = lh.inflationSeq;
+    LedgerDelta inflationDelta(delta);
+
+    auto& lcl = inflationDelta.getHeader();
+
+    time_t closeTime = lcl.scpValue.closeTime;
+    uint64_t seq = lcl.inflationSeq;
 
     time_t inflationTime = (INFLATION_START_TIME + seq * INFLATION_FREQUENCY);
     if (closeTime < inflationTime)
     {
+        app.getMetrics()
+            .NewMeter({"op-inflation", "failure", "not-time"}, "operation")
+            .Mark();
         innerResult().code(INFLATION_NOT_TIME);
         return false;
     }
@@ -51,81 +58,109 @@ InflationOpFrame::doApply(AbstractLedgerTxn& ltx)
        inflation pool
     */
 
-    int64_t totalVotes = lh.totalCoins;
-    int64_t minBalance =
-        bigDivide(totalVotes, INFLATION_WIN_MIN_PERCENT, TRILLION, ROUND_DOWN);
+    // int64_t totalVotes = lcl.totalCoins;
+    // int64_t minBalance =
+    //     bigDivide(totalVotes, INFLATION_WIN_MIN_PERCENT, TRILLION,
+    //     ROUND_DOWN);
 
-    auto winners = ltx.queryInflationWinners(INFLATION_NUM_WINNERS, minBalance);
+    // std::vector<AccountFrame::InflationVotes> winners;
+    auto& db = ledgerManager.getDatabase();
 
-    auto inflationAmount = bigDivide(lh.totalCoins, INFLATION_RATE_TRILLIONTHS,
-                                     TRILLION, ROUND_DOWN);
-    auto amountToDole = inflationAmount + lh.feePool;
+    // AccountFrame::processForInflation(
+    //     [&](AccountFrame::InflationVotes const& votes) {
+    //         if (votes.mVotes >= minBalance)
+    //         {
+    //             winners.push_back(votes);
+    //             return true;
+    //         }
+    //         return false;
+    //     },
+    //     INFLATION_NUM_WINNERS, db);
 
-    lh.feePool = 0;
-    lh.inflationSeq++;
+    auto inflationAmount = 0;
+    auto amountToDole = inflationAmount + lcl.feePool;
+
+    lcl.feePool = 0;
+    lcl.inflationSeq++;
 
     // now credit each account
     innerResult().code(INFLATION_SUCCESS);
     auto& payouts = innerResult().payouts();
 
+    Hash seed = sha256(app.getConfig().NETWORK_PASSPHRASE + "feepool");
+    SecretKey feeKey = SecretKey::fromSeed(seed);
+    AccountID feeDestination = feeKey.getPublicKey();
+
+    int64 toDoleThisWinner = amountToDole;
     int64 leftAfterDole = amountToDole;
 
-    for (auto const& w : winners)
+    AccountFrame::pointer winner;
+    winner = AccountFrame::loadAccount(inflationDelta, feeDestination, db);
+    if (winner)
     {
-        int64_t toDoleThisWinner =
-            bigDivide(amountToDole, w.votes, totalVotes, ROUND_DOWN);
-        if (toDoleThisWinner == 0)
-            continue;
-
-        if (lh.ledgerVersion >= 10)
+        leftAfterDole -= toDoleThisWinner;
+        /* if (ledgerManager.getCurrentLedgerVersion() <= 7) */
+        /* { */
+        /*     lcl.totalCoins += toDoleThisWinner; */
+        /* } */
+        if (!winner->addBalance(toDoleThisWinner))
         {
-            auto winner = stellar::loadAccountWithoutRecord(ltx, w.accountID);
-            if (winner)
-            {
-                toDoleThisWinner = std::min(getMaxAmountReceive(header, winner),
-                                            toDoleThisWinner);
-                if (toDoleThisWinner == 0)
-                    continue;
-            }
+            throw std::runtime_error(
+                "inflation overflowed destination balance");
         }
-
-        auto winner = stellar::loadAccount(ltx, w.accountID);
-        if (winner)
-        {
-            leftAfterDole -= toDoleThisWinner;
-            if (lh.ledgerVersion <= 7)
-            {
-                lh.totalCoins += toDoleThisWinner;
-            }
-            if (!addBalance(header, winner, toDoleThisWinner))
-            {
-                throw std::runtime_error(
-                    "inflation overflowed destination balance");
-            }
-            payouts.emplace_back(w.accountID, toDoleThisWinner);
-        }
+        winner->storeChange(inflationDelta, db);
+        payouts.emplace_back(feeDestination, toDoleThisWinner);
     }
+
+    // for (auto const& w : winners)
+    // {
+    //     AccountFrame::pointer winner;
+
+    //     int64 toDoleThisWinner =
+    //         bigDivide(amountToDole, w.mVotes, totalVotes, ROUND_DOWN);
+
+    //     if (toDoleThisWinner == 0)
+    //         continue;
+
+    //     winner =
+    //         AccountFrame::loadAccount(inflationDelta, w.mInflationDest, db);
+
+    //     if (winner)
+    //     {
+    //         leftAfterDole -= toDoleThisWinner;
+    //         if (ledgerManager.getCurrentLedgerVersion() <= 7)
+    //         {
+    //             lcl.totalCoins += toDoleThisWinner;
+    //         }
+    //         if (!winner->addBalance(toDoleThisWinner))
+    //         {
+    //             throw std::runtime_error(
+    //                 "inflation overflowed destination balance");
+    //         }
+    //         winner->storeChange(inflationDelta, db);
+    //         payouts.emplace_back(w.mInflationDest, toDoleThisWinner);
+    //     }
+    // }
 
     // put back in fee pool as unclaimed funds
-    lh.feePool += leftAfterDole;
-    if (lh.ledgerVersion > 7)
+    lcl.feePool += leftAfterDole;
+    if (ledgerManager.getCurrentLedgerVersion() > 7)
     {
-        lh.totalCoins += inflationAmount;
+        lcl.totalCoins += inflationAmount;
     }
 
+    inflationDelta.commit();
+
+    app.getMetrics()
+        .NewMeter({"op-inflation", "success", "apply"}, "operation")
+        .Mark();
     return true;
 }
 
 bool
-InflationOpFrame::doCheckValid(uint32_t ledgerVersion)
+InflationOpFrame::doCheckValid(Application& app)
 {
     return true;
-}
-
-bool
-InflationOpFrame::isVersionSupported(uint32_t protocolVersion) const
-{
-    return protocolVersion < 12;
 }
 
 ThresholdLevel
